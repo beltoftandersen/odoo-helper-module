@@ -9,12 +9,14 @@ class ProductTemplate(models.Model):
     custom_available_quantity = fields.Float(
         string="Custom Available Quantity",
         compute="_compute_custom_available_quantity",
-        store=True,
-        help="On-hand quantity minus reserved stock.",
-        digits=(16, 0)
+        store=False,
+        help="On-hand quantity minus outgoing demand.",
+        digits='Product Unit'
     )
 
     @api.depends('product_variant_ids', 'product_variant_ids.custom_available_quantity')
+    @api.depends_context('lot_id', 'owner_id', 'package_id', 'from_date', 'to_date',
+                         'location', 'warehouse_id', 'allowed_company_ids', 'is_storable')
     def _compute_custom_available_quantity(self):
         for template in self:
             template.custom_available_quantity = sum(
@@ -28,17 +30,16 @@ class ProductProduct(models.Model):
     custom_available_quantity = fields.Float(
         string="Custom Available Quantity",
         compute="_compute_custom_available_quantity",
-        store=True,
-        help="On-hand quantity minus reserved stock.",
-        digits=(16, 0)
+        store=False,
+        help="On-hand quantity minus outgoing demand.",
+        digits='Product Unit'
     )
 
     @api.depends('qty_available', 'outgoing_qty')
+    @api.depends_context('lot_id', 'owner_id', 'package_id', 'from_date', 'to_date',
+                         'location', 'warehouse_id', 'allowed_company_ids', 'is_storable')
     def _compute_custom_available_quantity(self):
         for product in self:
-            reserved_qty = sum(self.env['stock.quant'].search([
-                ('product_id', '=', product.id)
-            ]).mapped('reserved_quantity'))
             product.custom_available_quantity = product.qty_available - product.outgoing_qty
 
 
@@ -63,9 +64,10 @@ class SaleOrder(models.Model):
         store=False
     )
 
-    _sql_constraints = [
-        ('woocommerce_order_id_unique', 'unique(woocommerce_order_id)', 'WooCommerce Order ID must be unique.')
-    ]
+    _woocommerce_order_id_unique = models.Constraint(
+        'UNIQUE(woocommerce_order_id)',
+        'WooCommerce Order ID must be unique.',
+    )
 
     @api.depends('woocommerce_order_id', 'woocommerce_url')
     def _compute_woocommerce_order_link(self):

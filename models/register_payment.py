@@ -3,6 +3,7 @@
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError
 import logging
+import math
 
 _logger = logging.getLogger(__name__)
 
@@ -24,6 +25,21 @@ class PaymentRegister(models.Model):
 
     @api.model
     def register_payment(self, invoice_id, journal_id, payment_ref=None, payment_date=None, amount=None):
+        result = None
+        try:
+            with self.env.cr.savepoint():
+                result = self._register_payment(
+                    invoice_id, journal_id, payment_ref, payment_date, amount,
+                )
+                if not result['success']:
+                    raise UserError(result['message'])
+        except UserError:
+            if result is None:
+                raise
+        return result
+
+    @api.model
+    def _register_payment(self, invoice_id, journal_id, payment_ref=None, payment_date=None, amount=None):
         try:
             invoice = self.env['account.move'].browse(invoice_id)
             if not invoice.exists():
@@ -50,7 +66,7 @@ class PaymentRegister(models.Model):
 
             if amount is not None:
                 amount = float(amount)
-                if amount <= 0:
+                if not math.isfinite(amount) or amount <= 0:
                     raise UserError(f"Refusing to register a payment of {amount}.")
                 residual = abs(invoice.amount_residual)
                 if amount > residual + ROUNDING_TOLERANCE:
@@ -85,14 +101,12 @@ class PaymentRegister(models.Model):
             if not payment_register:
                 raise UserError(f"Failed to create payment register for invoice {invoice_id}.")
 
-            payments = payment_register.action_create_payments()
+            payments = payment_register._create_payments()
             if not payments:
                 raise UserError(f"No payments were created for invoice {invoice_id}.")
 
-            payment = payments[0] if len(payments) == 1 else None
-            if payment and payment_ref and hasattr(payment, 'custom_payment_ref'):
-                payment.custom_payment_ref = payment_ref
-                _logger.info(f"Payment Reference '{payment_ref}' set for Payment ID {payment.id}")
+            if payment_ref:
+                payments.write({'custom_payment_ref': payment_ref})
 
 
             _logger.info(f"Payment registered successfully for {invoice.move_type} {invoice.name} using Journal '{journal.name}'.")

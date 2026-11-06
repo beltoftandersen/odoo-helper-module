@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 {
-    'name': "Chimkins Helper module",
+    'name': "OdooWoo Helper",
     'summary': """
         This module creates necessary fields, enables webhooks, etc. for Chimkins Woocommerce integration.""",
 
@@ -11,9 +11,10 @@
     'author': "Chimkins IT",
     'website': "https://chimkins.com",
     'category': 'Technical',
-    'version': '1.2',
+    'version': '20.0.1.0.0',
 
-    'depends': ['base', 'product', 'sale', 'stock'],
+    'depends': ['sale_stock', 'account'],
+    'external_dependencies': {'python': ['requests']},
     'data': [
         'views/fields.xml',
         'views/payment_ref.xml',

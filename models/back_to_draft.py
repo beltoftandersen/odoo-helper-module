@@ -20,7 +20,7 @@ class SaleOrder(models.Model):
                 msg = _("Sale Order %s is not in a canceled state and cannot be reset.") % sale_order_id
                 raise exceptions.UserError(msg)
 
-            sale_order.write({'state': 'draft'})
+            sale_order.action_draft()
             log_message = _("Sale Order %s reset to draft successfully.") % sale_order_id
             _logger.info(log_message)
 
@@ -51,44 +51,20 @@ class SaleOrder(models.Model):
 
 
     def set_to_invoice_status(self):
-        try:
+        with self.env.cr.savepoint():
             self.write({'invoice_status': 'to invoice'})
             self.message_post(
                 body=_("Invoice status has been set to 'To Invoice'."),
-                subtype_xmlid='mail.mt_note'
+                subtype_xmlid='mail.mt_note',
             )
-            return True 
-        except Exception as e:
-            self.env.cr.rollback()
-            raise ValueError(_("Failed to update the invoice status: %s") % str(e))
+        return True
 
     def reset_all_deliveries_to_waiting(self):
-        try:
-            for order in self:
-                pickings = self.env['stock.picking'].search([
-                    ('origin', '=', order.name),
-                    ('state', 'in', ['confirmed', 'assigned'])  # Include both states
-                ])
-
-                if not pickings:
-                    _logger.info(f"No 'Confirmed' or 'Assigned' deliveries found for Sales Order {order.name}.")
-                    continue
-
-                for picking in pickings:
-                    _logger.info(f"Resetting delivery {picking.name} to 'Waiting' (Confirmed).")
-                    picking.write({'state': 'waiting'})  # Set to "Waiting"
-
-                _logger.info(f"All eligible deliveries for {order.name} have been reset to 'Waiting'.")
-
-            return True
-
-        except Exception as e:
-            _logger.exception(f"Error resetting deliveries for Sales Order {order.name}: {e}")
-            raise UserError(
-                _("Failed to reset deliveries to 'Waiting'.\nError: %s") % e
-            )
-
-
-        except Exception as e:
-            _logger.exception(f"Error resetting deliveries for Sales Order {self.name}: {e}")
-            raise UserError(_("Failed to reset deliveries to waiting. Please check the logs for details."))
+        # Picking state is computed from stock moves. Unreserve through core
+        # instead of writing a state that disagrees with the actual quants.
+        pickings = self.picking_ids.filtered(
+            lambda picking: picking.state not in ('done', 'cancel')
+        )
+        pickings.do_unreserve()
+        self.env['stock.quant']._schedule_stock_webhook(pickings.move_ids.product_id)
+        return True

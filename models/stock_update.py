@@ -1,334 +1,161 @@
-import requests
-import json
-import time
-from odoo import models, fields, api
+"""Send stock after commit, coalescing within each transaction."""
+
 import logging
-from odoo.tools import config
+import threading
+import time
+
+import requests
+
+from odoo import api, fields, models
 
 _logger = logging.getLogger(__name__)
-
-# Locations reported individually in the payload's by_location map, as
-# comma-separated ids in ir.config_parameter. Market - official and
-# Partnerships are internal but parentless and warehouse-less, so Odoo's
-# default (no location context) deliberately excludes them -- that is what
-# keeps their stock out of the shops. Naming them here reports them
-# alongside the warehouse figure without changing what the default means.
 STOCK_LOCATIONS_PARAM = 'webhook_stock_locations'
-DEFAULT_STOCK_LOCATION_IDS = (8,)  # WH/Stock
+PENDING_KEY = 'odoowoo_stock_sync'
+
+
+def _post_stock_webhook(url, payload):
+    """A thread receives plain data only, never an ORM record or cursor."""
+    for attempt in range(3):
+        try:
+            response = requests.post(url, json=payload, timeout=10,
+                                     headers={'Content-Type': 'application/json'})
+            if response.status_code in (200, 201, 202):
+                return True
+            _logger.warning('Stock webhook returned HTTP %s', response.status_code)
+        except requests.RequestException:
+            _logger.warning('Stock webhook request failed', exc_info=True)
+        if attempt < 2:
+            time.sleep(2 ** attempt)
+    return False
+
+
+def _dispatch_stock_webhook(url, payload):
+    threading.Thread(target=_post_stock_webhook, args=(url, payload), daemon=True).start()
+
 
 class StockQuant(models.Model):
     _inherit = 'stock.quant'
-    @api.model
-    def _get_webhook_dedup_key(self, products, operation_type='default'):
-        """Generate consistent deduplication key"""
-        product_ids = ','.join(map(str, sorted(products.ids)))
-        return f"webhook_{product_ids}_{operation_type}_{int(time.time())}"
-
-    @api.model
-    def _is_webhook_already_scheduled(self, products, operation_type='default'):
-        """Check if webhook is already scheduled for these products"""
-        if not hasattr(self.env.registry, '_webhook_scheduled'):
-            self.env.registry._webhook_scheduled = {}
-        
-        current_time = int(time.time())
-        old_keys = [k for k, v in self.env.registry._webhook_scheduled.items() 
-                   if current_time - v > 5]
-        for k in old_keys:
-            del self.env.registry._webhook_scheduled[k]
-        
-        base_key = f"webhook_{','.join(map(str, sorted(products.ids)))}"
-        existing_keys = [k for k in self.env.registry._webhook_scheduled.keys() 
-                        if k.startswith(base_key)]
-        
-        return bool(existing_keys)
-
-    @api.model
-    def _mark_webhook_scheduled(self, products, operation_type='default'):
-        """Mark webhook as scheduled for deduplication"""
-        if not hasattr(self.env.registry, '_webhook_scheduled'):
-            self.env.registry._webhook_scheduled = {}
-        
-        dedup_key = self._get_webhook_dedup_key(products, operation_type)
-        self.env.registry._webhook_scheduled[dedup_key] = int(time.time())
-        return dedup_key
-
-    @api.model
-    def _send_webhook_with_retry(self, webhook_url, payload, max_retries=3):
-        """Send webhook with exponential backoff retry"""
-        
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(
-                    webhook_url,
-                    json=payload,
-                    timeout=10,
-                    headers={'Content-Type': 'application/json'}
-                )
-                
-                if response.status_code in [200, 201, 202]:
-                    _logger.info(f"Stock webhook sent successfully (attempt {attempt + 1}) for {len(payload['products'])} products")
-                    return True
-                else:
-                    _logger.warning(f"Webhook attempt {attempt + 1} failed: {response.status_code} - {response.text}")
-                    
-            except requests.exceptions.Timeout:
-                _logger.warning(f"Webhook attempt {attempt + 1} timeout")
-            except requests.exceptions.RequestException as e:
-                _logger.warning(f"Webhook attempt {attempt + 1} failed: {str(e)}")
-            except Exception as e:
-                _logger.error(f"Webhook attempt {attempt + 1} unexpected error: {str(e)}")
-            
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-        
-        _logger.error(f"Webhook failed after {max_retries} attempts")
-        return False
 
     @api.model
     def _get_webhook_location_ids(self):
-        """Location ids to report separately, from ir.config_parameter.
-
-        Comma-separated, e.g. "8,309,310". Falls back to WH/Stock alone
-        when unset or unparseable: a bad value must not cost the payload
-        its per-location figures, let alone break the stock webhook.
-        """
-        raw = self.env['ir.config_parameter'].sudo().get_param(
-            STOCK_LOCATIONS_PARAM, default=''
-        )
-        location_ids = []
-        for chunk in (raw or '').split(','):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
+        raw = self.env['ir.config_parameter'].sudo().get_str(STOCK_LOCATIONS_PARAM, '')
+        ids = []
+        for chunk in raw.split(','):
             try:
-                location_ids.append(int(chunk))
-            except (TypeError, ValueError):
-                _logger.warning(
-                    "Ignoring non-numeric id %r in %s", chunk, STOCK_LOCATIONS_PARAM
-                )
-        return location_ids or list(DEFAULT_STOCK_LOCATION_IDS)
+                if chunk.strip():
+                    ids.append(int(chunk.strip()))
+            except ValueError:
+                _logger.warning('Ignoring invalid stock webhook location %r', chunk)
+        locations = self.env['stock.location'].browse(ids).exists().filtered(
+            lambda location: location.usage == 'internal'
+        )
+        if not locations:
+            locations = self.env['stock.warehouse'].search([
+                ('company_id', '=', self.env.company.id),
+            ]).lot_stock_id
+        return locations.ids
 
     @api.model
     def _get_stock_by_location(self, products, location_ids):
-        """{location_id_as_str: {product_id: figures}} for the given locations.
-
-        The whole recordset is scoped once per location rather than each
-        product individually: qty_available computes in batch, so this is
-        one pass per location instead of one per product per location.
-
-        Keys are strings because the payload is JSON. A location that
-        cannot be read is skipped with a warning rather than losing the
-        others, or the webhook.
-        """
-        by_location = {}
+        result = {}
         for location_id in location_ids:
-            try:
-                scoped = products.with_context(location=location_id)
-                by_location[str(location_id)] = {
-                    product.id: {
-                        'on_hand': product.qty_available,
-                        'forecast': product.virtual_available,
-                        'available': product.qty_available - product.outgoing_qty,
-                    }
-                    for product in scoped
-                }
-            except Exception as e:
-                _logger.warning(
-                    "Stock webhook: skipping location %s: %s", location_id, str(e)
-                )
-        return by_location
+            scoped = products.with_context(location=location_id)
+            result[str(location_id)] = {
+                product.id: {
+                    'on_hand': product.qty_available,
+                    'forecast': product.virtual_available,
+                    'available': product.qty_available - product.outgoing_qty,
+                } for product in scoped
+            }
+        return result
 
     @api.model
     def _send_stock_webhook(self, products):
-        """Send computed stock via webhook - optimized version"""
-        if not products:
-            _logger.info(f"Stock webhook skipped: products={bool(products)}")
+        config = self.env['ir.config_parameter'].sudo()
+        url = config.get_str('webhook_stock_update', '')
+        if not url or not products:
             return
-
-        try:
-            api_key = self.env['ir.config_parameter'].sudo().get_param('webhook_api_key', default='')
-            odoo_db = self.env.cr.dbname
-            odoo_url = self.env['ir.config_parameter'].sudo().get_param('web.base.url', default='')
-            webhook_url = self.env['ir.config_parameter'].sudo().get_param('webhook_stock_update', default='')
-
-            if not webhook_url:
-                return
-
-            # Unchanged: the top-level figures below stay exactly as they
-            # were, so anything reading the payload today keeps working and
-            # can fall back to them when by_location is absent.
-            by_location = self._get_stock_by_location(
-                products, self._get_webhook_location_ids()
-            )
-
-            stock_data = []
-            for product in products:
-                on_hand = product.qty_available
-                forecast = product.virtual_available
-                available = product.qty_available - product.outgoing_qty
-
-                stock_data.append({
-                    'product_id': product.id,
-                    'product_sku': product.default_code or '',
-                    'product_name': product.name,
-                    'on_hand': on_hand,
-                    'forecast': forecast,
-                    'available': available,
-                    'by_location': {
-                        location_key: figures[product.id]
-                        for location_key, figures in by_location.items()
-                        if product.id in figures
-                    }
-                })
-
-            payload = {
-                'timestamp': fields.Datetime.now().isoformat(),
-                'api_key': api_key,
-                'odoo_db': odoo_db,
-                'odoo_url': odoo_url,
-                'operation': 'stock_update',
-                'products': stock_data
-            }
-
-            self._send_webhook_async(webhook_url, payload)
-
-        except Exception as e:
-            _logger.error(f"Stock webhook preparation error: {str(e)}")
+        by_location = self._get_stock_by_location(products, self._get_webhook_location_ids())
+        payload = {
+            'timestamp': fields.Datetime.now().isoformat(),
+            'api_key': config.get_str('webhook_api_key', ''),
+            'odoo_db': self.env.cr.dbname,
+            'odoo_url': config.get_str('web.base.url', ''),
+            'operation': 'stock_update',
+            'products': [{
+                'product_id': product.id,
+                'product_sku': product.default_code or '',
+                'product_name': product.name,
+                'on_hand': product.qty_available,
+                'forecast': product.virtual_available,
+                'available': product.qty_available - product.outgoing_qty,
+                'by_location': {key: figures[product.id] for key, figures in by_location.items()},
+            } for product in products],
+        }
+        _dispatch_stock_webhook(url, payload)
 
     @api.model
-    def _send_webhook_async(self, webhook_url, payload):
-        """Send webhook asynchronously to avoid blocking stock operations"""
-        try:
-            import threading
+    def _schedule_stock_webhook(self, products):
+        products = products.filtered(lambda product: product.is_storable and product.sale_ok)
+        if not products or not self.env['ir.config_parameter'].sudo().get_str('webhook_stock_update', ''):
+            return
+        data = self.env.cr.postcommit.data
+        pending = data.get(PENDING_KEY)
+        if pending is None:
+            pending = data[PENDING_KEY] = set()
+            registry, uid, context = self.env.registry, self.env.uid, dict(self.env.context)
 
-            def send_request():
-                self._send_webhook_with_retry(webhook_url, payload)
+            def send_webhook():
+                try:
+                    with registry.cursor() as cursor:
+                        env = api.Environment(cursor, uid, context)
+                        env['stock.quant']._send_stock_webhook(
+                            env['product.product'].browse(sorted(pending)).exists()
+                        )
+                except Exception:
+                    _logger.exception('Stock webhook preparation failed after commit')
 
-            thread = threading.Thread(target=send_request)
-            thread.daemon = True
-            thread.start()
+            self.env.cr.postcommit.add(send_webhook)
+        pending.update(products.ids)
 
-        except Exception as e:
-            _logger.error(f"Failed to start webhook thread: {str(e)}")
 
 class StockMove(models.Model):
     _inherit = 'stock.move'
 
     def _action_done(self, *args, **kwargs):
-        """Trigger webhook on move completion"""
-        _logger.info(f"Stock move _action_done called for moves: {self.ids}")
         result = super()._action_done(*args, **kwargs)
-
-        affected_products = self.mapped('product_id').filtered(
-            lambda p: p.type == 'product' and p.sale_ok
-        )
-        _logger.info(f"Stock webhook trigger from moves: {len(affected_products)} products affected")
-        if affected_products:
-            self._schedule_post_commit_webhook(affected_products, 'done')
-
+        self.env['stock.quant']._schedule_stock_webhook(self.product_id)
         return result
 
-    def _action_assign(self, force_qty=None, *args, **kwargs):
-        """Trigger webhook when stock is reserved (SO confirmation)"""
-        context_skip = self.env.context.get('skip_stock_webhook', False)
-        affected_products = self.mapped('product_id').filtered(
-            lambda p: p.type == 'product' and p.sale_ok
-        )
-
-        result = super()._action_assign(force_qty, *args, **kwargs)
-        
-        will_be_done = any(move.state == 'assigned' and move.picking_id.state == 'assigned' for move in self)
-        
-        if affected_products and not context_skip and not will_be_done:
-            _logger.info(f"Stock webhook trigger from reservation: {len(affected_products)} products affected")
-            self._schedule_post_commit_webhook(affected_products, 'assign')
-        
+    def _action_assign(self, force_qty=False):
+        result = super()._action_assign(force_qty=force_qty)
+        if not self.env.context.get('skip_stock_webhook'):
+            self.env['stock.quant']._schedule_stock_webhook(self.product_id)
         return result
 
     def _action_cancel(self):
-        """Trigger webhook when moves are cancelled (unreserve stock)"""
-        context_skip = self.env.context.get('skip_stock_webhook', False)
-        affected_products = self.mapped('product_id')
+        products = self.product_id
         result = super()._action_cancel()
-        
-        if affected_products and not context_skip:
-            _logger.info(f"Stock webhook trigger from cancellation: {len(affected_products)} products affected")
-            self._schedule_post_commit_webhook(affected_products, 'cancel')
-        
+        if not self.env.context.get('skip_stock_webhook'):
+            self.env['stock.quant']._schedule_stock_webhook(products)
         return result
 
-    def _schedule_post_commit_webhook(self, products, operation_type):
-        """Schedule webhook to run after transaction commit with centralized deduplication"""
-        if self.env['stock.quant']._is_webhook_already_scheduled(products, operation_type):
-            _logger.info(f"Skipped duplicate webhook for operation {operation_type}")
-            return
-
-        def send_webhook():
-            try:
-                with self.env.registry.cursor() as new_cr:
-                    new_env = api.Environment(new_cr, self.env.uid, self.env.context)
-                    fresh_products = new_env['product.product'].browse(products.ids)
-                    new_env['stock.quant']._send_stock_webhook(fresh_products)
-            except Exception as e:
-                _logger.error(f"Post-commit webhook error: {str(e)}")
-
-        dedup_key = self.env['stock.quant']._mark_webhook_scheduled(products, operation_type)
-        self.env.cr.postcommit.add(send_webhook)
-        _logger.info(f"Scheduled webhook for operation {operation_type} with key {dedup_key}")
+    def _trigger_assign(self):
+        excluded = self.env.context.get('odoowoo_paid_receipt_ids', ())
+        moves = self.filtered(lambda move: move.picking_id.id not in excluded)
+        return super(StockMove, moves)._trigger_assign()
 
 
 class SaleOrder(models.Model):
     _inherit = 'sale.order'
 
     def action_confirm(self):
-        """Trigger webhook when SO is confirmed (stock reserved)"""
         result = super(SaleOrder, self.with_context(skip_stock_webhook=True)).action_confirm()
-
-        affected_products = self.order_line.mapped('product_id').filtered(
-            lambda p: p.type == 'product'
-        )
-
-        if affected_products:
-            _logger.info(f"Stock webhook trigger from SO confirmation: {len(affected_products)} products affected")
-            self._schedule_post_commit_webhook(affected_products, 'so_confirm')
-
+        self.env['stock.quant']._schedule_stock_webhook(self.order_line.product_id)
         return result
 
     def action_cancel(self):
-        """Trigger webhook when SO is cancelled (stock unreserved)"""
-        affected_products = self.order_line.mapped('product_id').filtered(
-            lambda p: p.type == 'product'
-        )
-
-        was_confirmed = any(order.state in ['sale', 'done'] for order in self)
-        
+        products = self.order_line.product_id
         result = super(SaleOrder, self.with_context(skip_stock_webhook=True)).action_cancel()
-        
-        actually_cancelled = any(order.state == 'cancel' for order in self)
-
-        if affected_products and was_confirmed and actually_cancelled:
-            _logger.info(f"Stock webhook trigger from SO cancellation: {len(affected_products)} products affected")
-            self._schedule_post_commit_webhook(affected_products, 'so_cancel')
-        elif not actually_cancelled:
-            _logger.info(f"SO cancellation webhook skipped - orders not actually cancelled")
-
+        self.env['stock.quant']._schedule_stock_webhook(products)
         return result
-
-    def _schedule_post_commit_webhook(self, products, operation_type):
-        """Schedule webhook to run after transaction commit with centralized deduplication"""
-        if self.env['stock.quant']._is_webhook_already_scheduled(products, operation_type):
-            _logger.info(f"Skipped duplicate webhook for operation {operation_type}")
-            return
-
-        def send_webhook():
-            try:
-                with self.env.registry.cursor() as new_cr:
-                    new_env = api.Environment(new_cr, self.env.uid, self.env.context)
-                    fresh_products = new_env['product.product'].browse(products.ids)
-                    new_env['stock.quant']._send_stock_webhook(fresh_products)
-            except Exception as e:
-                _logger.error(f"Post-commit webhook error: {str(e)}")
-
-        dedup_key = self.env['stock.quant']._mark_webhook_scheduled(products, operation_type)
-        self.env.cr.postcommit.add(send_webhook)
-        _logger.info(f"Scheduled SO webhook for operation {operation_type} with key {dedup_key}")

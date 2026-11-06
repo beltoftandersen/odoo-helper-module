@@ -140,7 +140,7 @@ class ProductTemplate(models.Model):
         """
         try:
             icp = self.env['ir.config_parameter'].sudo()
-            url = icp.get_param(PRICE_WEBHOOK_PARAM, default='')
+            url = icp.get_str(PRICE_WEBHOOK_PARAM, default='')
             if not url:
                 # Middleware not redeployed yet. Staying silent on purpose:
                 # logging here would fire on every price edit.
@@ -156,7 +156,7 @@ class ProductTemplate(models.Model):
                 pending = data[PENDING_KEY] = {
                     'entries': {},
                     'url': url,
-                    'api_key': icp.get_param(API_KEY_PARAM, default=''),
+                    'api_key': icp.get_str(API_KEY_PARAM, default=''),
                 }
                 self.env.cr.postcommit.add(lambda: _fire_price_sync(pending))
 

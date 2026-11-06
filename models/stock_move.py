@@ -1,87 +1,94 @@
-from odoo import models, fields, api
-import requests
-import logging
+"""Copy store references and notify completion only after stock commits."""
 
-logger = logging.getLogger(__name__)
+import logging
+import threading
+
+import requests
+
+from odoo import api, fields, models
+
+_logger = logging.getLogger(__name__)
+PENDING_KEY = 'odoowoo_status_sync'
+
+
+def _post_status_webhook(registry, uid, context, picking_ids, url, payload):
+    try:
+        response = requests.post(url, json=payload, timeout=10,
+                                 headers={'Content-Type': 'application/json'})
+        response.raise_for_status()
+        with registry.cursor() as cursor:
+            env = api.Environment(cursor, uid, context)
+            env['stock.picking'].browse(picking_ids).exists().write({
+                'woocommerce_webhook_sent': True,
+            })
+            cursor.commit()
+    except Exception:
+        _logger.exception('Order completion webhook failed')
+
+
+def _dispatch_status_webhook(*args):
+    threading.Thread(target=_post_status_webhook, args=args, daemon=True).start()
+
 
 class StockPicking(models.Model):
     _inherit = 'stock.picking'
 
-    woocommerce_order_id = fields.Char(
-        string="WooCommerce Order ID",
-        help="WooCommerce Order associated with this picking."
-    )
-    # Optional flag to mark that a webhook has been sent for this order
-    woocommerce_webhook_sent = fields.Boolean(
-        string="WooCommerce Webhook Sent",
-        default=False,
-        help="Indicates if a webhook has already been sent for this WooCommerce order."
-    )
+    woocommerce_order_id = fields.Char(string='WooCommerce Order ID', copy=False)
+    woocommerce_webhook_sent = fields.Boolean(string='WooCommerce Webhook Sent', copy=False)
 
-    @api.model
-    def create(self, vals):
-        picking = super(StockPicking, self).create(vals)
-        if 'origin' in vals:
-            sale_order = self.env['sale.order'].search([('name', '=', vals['origin'])], limit=1)
-            if sale_order and sale_order.woocommerce_order_id:
-                picking.woocommerce_order_id = sale_order.woocommerce_order_id
-        if picking.woocommerce_order_id:
-            picking.move_ids.write({'woocommerce_order_id': picking.woocommerce_order_id})
-        return picking
+    @api.model_create_multi
+    def create(self, vals_list):
+        vals_list = [dict(vals) for vals in vals_list]
+        origins = {vals['origin'] for vals in vals_list if vals.get('origin')}
+        orders = self.env['sale.order'].search([('name', 'in', list(origins))])
+        references = {order.name: order.woocommerce_order_id for order in orders}
+        for vals in vals_list:
+            if not vals.get('woocommerce_order_id') and references.get(vals.get('origin')):
+                vals['woocommerce_order_id'] = references[vals['origin']]
+        pickings = super().create(vals_list)
+        for picking in pickings:
+            if picking.woocommerce_order_id:
+                picking.move_ids.woocommerce_order_id = picking.woocommerce_order_id
+        return pickings
 
     def button_validate(self):
-        res = super(StockPicking, self).button_validate()
-        for picking in self:
-            # Only consider outgoing or direct pickings (adjust as needed)
-            if picking.woocommerce_order_id and picking.picking_type_id.code in ['outgoing', 'direct']:
-                picking._check_and_send_webhook()
-        return res
+        result = super().button_validate()
+        for picking in self.filtered(
+            lambda p: p.state == 'done' and p.woocommerce_order_id
+            and p.picking_type_id.code == 'outgoing'
+        ):
+            picking._check_and_send_webhook()
+        return result
 
     def _check_and_send_webhook(self):
-        """Check if all pickings for this WooCommerce order are done, and if so, send a webhook."""
-        # If webhook already sent, do nothing
+        self.ensure_one()
         if self.woocommerce_webhook_sent:
             return
-
-        # Get all pickings with the same WooCommerce order and of relevant type.
-        # Cancelled pickings are excluded: they never reach 'done', so leaving
-        # them in would block the webhook for this order forever.
-        related_pickings = self.search([
+        related = self.search([
             ('woocommerce_order_id', '=', self.woocommerce_order_id),
-            ('picking_type_id.code', 'in', ['outgoing', 'direct']),
+            ('picking_type_id.code', '=', 'outgoing'),
             ('state', '!=', 'cancel'),
         ])
-        # Check if all these pickings are done
-        if related_pickings and all(p.state == 'done' for p in related_pickings):
-            self._send_woocommerce_webhook()
-            # Mark all related pickings (or the order) as webhook sent
-            related_pickings.write({'woocommerce_webhook_sent': True})
-        else:
-            logger.info(f"Not all pickings for WooCommerce Order ID '{self.woocommerce_order_id}' are done.")
+        if related and all(picking.state == 'done' for picking in related):
+            self._send_woocommerce_webhook(related)
 
-    def _send_woocommerce_webhook(self):
-        """Send the webhook to update the WooCommerce order status."""
-        api_key = self.env['ir.config_parameter'].sudo().get_param('webhook_api_key', default='')
-        if not api_key:
-            logger.warning("No global API key found for webhook. Webhook not sent.")
+    def _send_woocommerce_webhook(self, related=None):
+        self.ensure_one()
+        config = self.env['ir.config_parameter'].sudo()
+        url = config.get_str('webhook_change_status', '')
+        key = config.get_str('webhook_api_key', '')
+        if not url or not key:
             return
-
-        url = self.env['ir.config_parameter'].sudo().get_param('webhook_change_status', default='')
-        if not url:
-            logger.warning("No return URL found for webhook. Webhook not sent.")
+        pending = self.env.cr.postcommit.data.setdefault(PENDING_KEY, set())
+        if self.woocommerce_order_id in pending:
             return
-
-        payload = {
-            'woocommerce_order_id': self.woocommerce_order_id,
-            'status': 'completed',
-            'date_done': self.date_done.isoformat() if self.date_done else None,
-            'api_key': api_key,
-        }
-        headers = {'Content-Type': 'application/json'}
-        try:
-            logger.info(f"Sending webhook for WooCommerce Order ID '{self.woocommerce_order_id}' with payload: {payload}")
-            response = requests.post(url, json=payload, headers=headers, timeout=10)
-            response.raise_for_status()
-            logger.info(f"Webhook sent successfully for WooCommerce Order ID '{self.woocommerce_order_id}'.")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send webhook for WooCommerce Order ID '{self.woocommerce_order_id}': {e}")
+        pending.add(self.woocommerce_order_id)
+        args = (
+            self.env.registry, self.env.uid, dict(self.env.context),
+            (related or self).ids, url,
+            {'woocommerce_order_id': self.woocommerce_order_id,
+             'status': 'completed',
+             'date_done': self.date_done.isoformat() if self.date_done else None,
+             'api_key': key},
+        )
+        self.env.cr.postcommit.add(lambda: _dispatch_status_webhook(*args))
