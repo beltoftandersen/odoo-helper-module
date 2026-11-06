@@ -1,0 +1,210 @@
+# /models/register_payment.py
+
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError
+import logging
+
+_logger = logging.getLogger(__name__)
+
+# One cent of rounding, plus the half-cent epsilon the comparison already
+# carried. An amount that is only this far over the residual is a rounding
+# difference, not an overpayment: the middleware sends WooCommerce's gross
+# coupon figure while the residual is Odoo recomputing VAT from the net that
+# was added back, and on a dashboard that books orders ex-tax the two land a
+# cent apart. Anything larger is a real discrepancy and still refused.
+ROUNDING_TOLERANCE = 0.015
+
+class PaymentRegister(models.Model):
+    _name = 'payment.register'
+    _description = 'Payment Register'
+
+    invoice_id = fields.Many2one('account.move', string='Invoice', required=True)
+    journal_id = fields.Many2one('account.journal', string='Payment Journal', required=True)
+    custom_payment_ref = fields.Char(string="Payment ref.")
+
+    @api.model
+    def register_payment(self, invoice_id, journal_id, payment_ref=None, payment_date=None, amount=None):
+        try:
+            invoice = self.env['account.move'].browse(invoice_id)
+            if not invoice.exists():
+                raise UserError(f"Invoice with ID {invoice_id} does not exist.")
+            if invoice.state != 'posted':
+                raise UserError(f"Invoice {invoice_id} is not in a posted state.")
+
+            journal = self.env['account.journal'].browse(journal_id)
+            if not journal.exists():
+                raise UserError(f"Journal with ID {journal_id} does not exist.")
+
+            context = {
+                'active_model': 'account.move',
+                'active_ids': [invoice.id],
+            }
+
+            payment_register_vals = {
+                'journal_id': journal.id,
+            }
+
+            if payment_date:
+                payment_register_vals['payment_date'] = payment_date
+                _logger.info(f"Using payment date: {payment_date}")
+
+            if amount is not None:
+                amount = float(amount)
+                if amount <= 0:
+                    raise UserError(f"Refusing to register a payment of {amount}.")
+                residual = abs(invoice.amount_residual)
+                if amount > residual + ROUNDING_TOLERANCE:
+                    raise UserError(
+                        f"Payment of {amount} exceeds the {residual} still open on "
+                        f"{invoice.name}."
+                    )
+                if amount > residual:
+                    # Clamped rather than refused. Raising here failed the whole
+                    # gift card payment over a cent, and since the middleware
+                    # recomputes the same figures on every retry the order then
+                    # errored the same way for ever. Bringing the amount down to
+                    # the residual settles the invoice exactly.
+                    _logger.info(
+                        "Payment of %s is %s over the %s open on %s; clamping it to "
+                        "the residual as a rounding difference.",
+                        amount, amount - residual, residual, invoice.name,
+                    )
+                    amount = residual
+                payment_register_vals['amount'] = amount
+                if amount < residual - 0.005:
+                    # A gift card pays part of an invoice and the customer's own
+                    # payment method pays the rest, so the invoice must stay open
+                    # for the second payment rather than be written down here.
+                    payment_register_vals['payment_difference_handling'] = 'open'
+                _logger.info(f"Registering a partial payment of {amount} of {residual}")
+
+            if hasattr(self.env['account.payment.register'], 'custom_payment_ref') and payment_ref:
+                payment_register_vals['custom_payment_ref'] = payment_ref
+
+            payment_register = self.env['account.payment.register'].with_context(**context).create(payment_register_vals)
+            if not payment_register:
+                raise UserError(f"Failed to create payment register for invoice {invoice_id}.")
+
+            payments = payment_register.action_create_payments()
+            if not payments:
+                raise UserError(f"No payments were created for invoice {invoice_id}.")
+
+            payment = payments[0] if len(payments) == 1 else None
+            if payment and payment_ref and hasattr(payment, 'custom_payment_ref'):
+                payment.custom_payment_ref = payment_ref
+                _logger.info(f"Payment Reference '{payment_ref}' set for Payment ID {payment.id}")
+
+
+            _logger.info(f"Payment registered successfully for {invoice.move_type} {invoice.name} using Journal '{journal.name}'.")
+
+            invoice_ref = invoice.name or f"Move ID {invoice_id}"
+
+            woocommerce_order_id = invoice.woocommerce_order_id or False
+
+            if not woocommerce_order_id:
+                sale_orders = invoice.line_ids.mapped('sale_line_ids.order_id')
+                if sale_orders:
+                    woocommerce_order_id = sale_orders[:1].woocommerce_order_id or False
+
+            doc_type = "Credit Note" if invoice.move_type == 'out_refund' else "Invoice"
+            log_message = f"Payment registered successfully for {doc_type} {invoice_ref} using Journal '{journal.name}'."
+
+            return {
+                "success": True,
+                "message": f"Payment registered for {doc_type} {invoice_ref} using journal {journal.name}",
+                "payment_register_id": payment_register.id,
+                "invoice_ref": invoice_ref,
+                "woocommerce_order_id": woocommerce_order_id,
+                "move_type": invoice.move_type,
+                "log_message": log_message
+            }
+
+        except UserError as ue:
+            _logger.error(f"UserError during payment registration: {ue}")
+            invoice_ref = 'Unknown'
+            invoice = locals().get('invoice')
+            if invoice and invoice.exists():
+                invoice_ref = invoice.name
+            return {
+                "success": False,
+                "message": str(ue),
+                "payment_register_id": 0,
+                "invoice_ref": invoice_ref,
+                "woocommerce_order_id": False,
+                "log_message": str(ue)
+            }
+        except Exception as e:
+            _logger.exception(f"Unexpected error during payment registration: {e}")
+            invoice_ref = 'Unknown'
+            invoice = locals().get('invoice')
+            if invoice and invoice.exists():
+                invoice_ref = invoice.name
+            return {
+                "success": False,
+                "message": str(e),
+                "payment_register_id": 0,
+                "invoice_ref": invoice_ref,
+                "woocommerce_order_id": False,
+                "log_message": str(e)
+            }
+
+
+class SaleOrder(models.Model):
+    _inherit = "sale.order"
+
+    def assign_deliveries_for_paid_so(self):
+        try:
+            for order in self:
+                _logger.info(f"[reset_first_delivery_to_assigned] Processing Sale Order: {order.name} (ID: {order.id})")
+
+                # Every open picking, not just the first "waiting" one. The old
+                # search took one picking and wrote {"state": "assigned"} onto
+                # it directly. That set the stored column without reserving
+                # anything, so the record claimed Ready while its moves stayed
+                # waiting - and in a two-step warehouse the first waiting
+                # picking is WH/OUT, which is chained to the pick and must NOT
+                # be Ready until that pick is validated.
+                #
+                # action_assign reserves for real and lets Odoo compute the
+                # state. A picking that cannot be reserved simply stays as it
+                # is, which is the honest answer.
+                pickings = self.env["stock.picking"].search([
+                    ("origin", "=", order.name),
+                    ("state", "not in", ["done", "cancel"]),
+                ], order="id asc")
+
+                if not pickings:
+                    _logger.info(f"No open pickings found for {order.name}.")
+                    continue
+
+                for picking in pickings:
+                    before = picking.state
+                    picking.action_assign()
+                    picking.invalidate_recordset(["state"])
+                    after = picking.state
+
+                    if after == before:
+                        _logger.info(
+                            f"Picking '{picking.name}' unchanged after reservation "
+                            f"(state: {after})."
+                        )
+                        continue
+
+                    _logger.info(
+                        f"Picking '{picking.name}' moved from '{before}' to '{after}' "
+                        f"after reserving."
+                    )
+                    if after == "assigned":
+                        picking.message_post(
+                            body=_("Delivery is Ready: stock was reserved."),
+                            subtype_xmlid="mail.mt_note"
+                        )
+
+            _logger.info("[reset_first_delivery_to_assigned] Finished processing all 'Waiting' pickings.")
+            return True
+
+        except Exception as e:
+            _logger.exception("Error checking stock before setting the first delivery to 'assigned': %s", e)
+            raise UserError(
+                _("Failed to check stock before setting delivery to 'assigned'.\nError: %s") % e
+            )
