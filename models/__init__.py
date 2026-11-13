@@ -16,3 +16,4 @@ from . import price_webhook
 from . import complete_deliveries
 from . import config_parameter
 from . import document_partner_name
+from . import invoice_line_label
