@@ -15,3 +15,4 @@ from . import pricelist_api
 from . import price_webhook
 from . import complete_deliveries
 from . import config_parameter
+from . import document_partner_name
