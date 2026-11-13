@@ -18,7 +18,10 @@ class AccountMoveLine(models.Model):
     def _compute_label(self):
         super()._compute_label()
 
-        if self.env['ir.config_parameter'].sudo().get_param(PARAM, '') not in ('1', 'true', 'True'):
+        icp = self.env['ir.config_parameter'].sudo()
+        # Odoo 20 reads parameters with get_str; older versions with get_param.
+        read = getattr(icp, 'get_str', None) or icp.get_param
+        if (read(PARAM, '') or '') not in ('1', 'true', 'True'):
             return
 
         for line in self:
