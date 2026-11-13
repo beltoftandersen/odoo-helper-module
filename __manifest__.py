@@ -11,7 +11,7 @@
     'author': "Chimkins IT",
     'website': "https://chimkins.com",
     'category': 'Technical',
-    'version': '20.0.1.0.0',
+    'version': '20.0.1.1.0',
 
     'depends': ['sale_stock', 'account'],
     'external_dependencies': {'python': ['requests']},
@@ -19,6 +19,7 @@
         'views/fields.xml',
         'views/payment_ref.xml',
         'views/search.xml',
+        'views/report_invoice_columns.xml',
     ],
 
     'installable': True,

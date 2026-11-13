@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Invoice PDF: the quantity with its unit when it is not "Units" ("312,00 Timer"), and the unit price with only the decimals it needs
+     (35,00 and 0,0397), so hours x price per hour reads as columns. -->
+<odoo>
+    <template id="report_invoice_document_odoowoo_columns" inherit_id="account.report_invoice_document">
+        <xpath expr="//td[@name='td_quantity']" position="replace">
+            <td name="td_quantity" class="o_td_quantity text-end">
+                <span class="text-nowrap" t-out="line._odoowoo_quantity_text()">3,00</span>
+            </td>
+        </xpath>
+        <xpath expr="//td[@name='td_price_unit']/span" position="replace">
+            <span t-if="not hide_prices" class="text-nowrap" t-out="line._odoowoo_price_text()">9,00</span>
+        </xpath>
+    </template>
+</odoo>
